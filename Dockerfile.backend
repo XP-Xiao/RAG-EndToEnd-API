@@ -1,0 +1,28 @@
+# ============================================
+# RAG-EndToEnd-API 后端 Docker 镜像（FastAPI）
+# ============================================
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# 系统依赖（sentence-transformers 编译可能需要）
+RUN apt-get update \
+    && apt-get install -y --fix-missing --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# 安装 Python 依赖（requirements 中已声明 CPU 版 PyTorch 源）
+COPY requirements-backend.txt .
+RUN pip install --no-cache-dir -r requirements-backend.txt
+
+# 预下载 HuggingFace 嵌入模型（运行时 local_files_only=True 即可工作）
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+
+# 只复制后端所需代码（不需要 streamlit_app.py）
+COPY main.py rag_engine.py ./
+
+ENV DEEPSEEK_API_KEY=""
+ENV USER_AGENT="RAG-EndToEnd-API/1.0"
+
+EXPOSE 8000
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -1,0 +1,17 @@
+# ============================================
+# RAG-EndToEnd-API 前端 Docker 镜像（Streamlit）
+# ============================================
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# 安装前端依赖（轻量，无需 PyTorch）
+COPY requirements-frontend.txt .
+RUN pip install --no-cache-dir -r requirements-frontend.txt
+
+# 只复制前端代码
+COPY streamlit_app.py .
+
+EXPOSE 8501
+
+CMD ["streamlit", "run", "streamlit_app.py", "--server.port", "8501", "--server.address", "0.0.0.0"]

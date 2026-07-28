@@ -1,0 +1,352 @@
+"""
+FastAPI 后端：提供文档上传和问答 API
+"""
+import os
+
+# 必须在 import rag_engine/agent_engine（会加载 huggingface_hub）之前设置：
+# huggingface_hub 在 import 时就读取该变量，事后设置无效，
+# 否则启动时会反复请求 huggingface.co 超时重试，卡住几分钟
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+import re
+from contextlib import asynccontextmanager
+from dotenv import load_dotenv, find_dotenv
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from rag_engine import RAGEngine
+from agent_engine import ResearchAssistant
+from redis_cache import (
+    init_llm_cache,
+    create_async_client,
+    get_cached_answer,
+    set_cached_answer,
+    bump_kb_version,
+)
+
+# 加载环境变量（DeepSeek API Key 等）
+load_dotenv(find_dotenv())
+
+# WebBaseLoader 需要 USER_AGENT
+os.environ.setdefault("USER_AGENT", "RAG-EndToEnd-API/1.0")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 启动：启用 LLM 响应缓存（同步客户端，Redis 不可用时自动降级），
+    # 并建立路由层共享的异步客户端（Depends(get_redis) 使用）
+    init_llm_cache()
+    # 进程重启后 RAG 内存索引已清空，旧答案缓存基于已不存在的知识库，必须作废
+    bump_kb_version()
+    app.state.redis = create_async_client()
+    yield
+    # 关闭：释放异步连接池
+    await app.state.redis.aclose()
+
+
+app = FastAPI(title="RAG 文档问答 API", version="1.0", lifespan=lifespan)
+
+# CORS 配置：允许 Streamlit 前端跨域访问
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 全局 RAG 引擎实例
+rag = RAGEngine()
+
+# 研究助手 Agent（RAG + Web 搜索 + Postgres 长短期记忆）
+assistant = ResearchAssistant(rag)
+
+
+# =============================================
+# 请求/响应模型
+# =============================================
+
+class AskRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=500, description="用户提问")
+
+
+class SourceDoc(BaseModel):
+    index: int
+    content: str
+
+
+class AskResponse(BaseModel):
+    answer: str = Field(description="AI 回答")
+    sources: list[SourceDoc] = Field(default=[], description="参考文档片段")
+
+
+class UploadResponse(BaseModel):
+    message: str
+    filename: str
+    chunks: int = Field(description="分割后的文档块数")
+
+
+class URLRequest(BaseModel):
+    url: str = Field(min_length=1, description="网页文档 URL")
+
+
+class StatusResponse(BaseModel):
+    has_index: bool
+    doc_count: int
+    doc_names: list[str]
+    chunk_count: int
+    documents: list[dict] = Field(default=[], description="文档列表（含 doc_id、name、chunks）")
+
+
+class ClearResponse(BaseModel):
+    message: str
+
+
+class DeleteResponse(BaseModel):
+    message: str
+
+
+class AgentAskRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=2000, description="用户提问")
+    thread_id: str = Field(min_length=1, max_length=64, description="会话 ID（短期记忆隔离）")
+    user_id: str = Field(default="default_user", max_length=64, description="用户 ID（长期记忆隔离）")
+
+
+class AgentStep(BaseModel):
+    tool: str
+    input: str
+    output: str = ""
+
+
+class AgentUsage(BaseModel):
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    cache_hit_tokens: int = Field(default=0, description="DeepSeek 前缀缓存命中的输入 token（按 1 折计费）")
+
+
+class AgentAskResponse(BaseModel):
+    answer: str = Field(description="Agent 回答")
+    steps: list[AgentStep] = Field(default=[], description="工具调用轨迹")
+    usage: AgentUsage = Field(default_factory=AgentUsage, description="本轮 token 用量（答案缓存命中时为 0）")
+
+
+class HistoryMessage(BaseModel):
+    role: str
+    content: str
+
+
+class AgentHistoryResponse(BaseModel):
+    thread_id: str
+    messages: list[HistoryMessage]
+
+
+class ThreadInfo(BaseModel):
+    thread_id: str
+    title: str
+    updated_at: str
+
+
+class ThreadListResponse(BaseModel):
+    threads: list[ThreadInfo]
+
+
+class BalanceResponse(BaseModel):
+    available: bool
+    currency: str = ""
+    total_balance: str = ""
+
+
+# =============================================
+# API 路由
+# =============================================
+
+@app.get("/")
+async def root():
+    return {"message": "RAG 文档问答 API 已启动", "docs": "/docs"}
+
+
+@app.post("/upload", response_model=UploadResponse)
+async def upload_document(file: UploadFile = File(...)):
+    """上传文档文件（支持 .txt、.md、.pdf），建立向量索引"""
+    from starlette.concurrency import run_in_threadpool
+
+    # 检查文件类型
+    allowed_types = [".txt", ".md", ".pdf"]
+    filename = file.filename or ""
+    ext = os.path.splitext(filename)[1].lower()
+
+    if ext not in allowed_types:
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的文件类型 '{ext}'，仅支持 {allowed_types}"
+        )
+
+    # 读取文件内容
+    content = await file.read()
+
+    if not content.strip():
+        raise HTTPException(status_code=400, detail="文件内容为空")
+
+    if ext == ".pdf":
+        # PDF 文件：直接传字节给 MinerU 解析（无需写临时文件）
+        chunks = await run_in_threadpool(rag.ingest_pdf, content, filename)
+    else:
+        # 文本文件：直接解析
+        text = content.decode("utf-8")
+        chunks = rag.ingest_text(text, doc_name=filename)
+
+    # 知识库变更，旧答案缓存失效
+    bump_kb_version()
+
+    return UploadResponse(
+        message=f"文档 '{filename}' 上传成功，已建立索引",
+        filename=filename,
+        chunks=chunks,
+    )
+
+
+@app.post("/ask", response_model=AskResponse)
+async def ask_question(req: AskRequest):
+    """根据已上传的文档回答问题"""
+    result = rag.ask(req.question)
+    return AskResponse(**result)
+
+
+@app.post("/upload_url", response_model=UploadResponse)
+async def upload_from_url(req: URLRequest):
+    """从网页 URL 加载文档并建立向量索引"""
+    url = req.url.strip()
+
+    # 简单 URL 格式校验
+    if not re.match(r'^https?://', url):
+        raise HTTPException(status_code=400, detail="URL 必须以 http:// 或 https:// 开头")
+
+    try:
+        chunks = rag.ingest_url(url, doc_name=url)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"无法加载网页内容：{str(e)[:200]}")
+
+    if chunks == 0:
+        raise HTTPException(status_code=400, detail="网页内容为空或无法解析")
+
+    # 知识库变更，旧答案缓存失效
+    bump_kb_version()
+
+    return UploadResponse(
+        message=f"网页 '{url}' 加载成功，已建立索引",
+        filename=url,
+        chunks=chunks,
+    )
+
+
+@app.get("/status", response_model=StatusResponse)
+async def get_status():
+    """获取当前文档索引状态"""
+    return StatusResponse(**rag.get_status())
+
+
+@app.post("/clear", response_model=ClearResponse)
+async def clear_documents():
+    """清空所有文档索引和对话上下文"""
+    rag.clear()
+    bump_kb_version()
+    return ClearResponse(message="所有文档索引已清空")
+
+
+@app.delete("/documents/{doc_id}", response_model=DeleteResponse)
+async def delete_document(doc_id: str):
+    """删除指定文档（同步更新 Milvus 和 BM25 索引）"""
+    success = rag.remove_document(doc_id)
+    if not success:
+        raise HTTPException(status_code=404, detail=f"文档 '{doc_id}' 不存在")
+    bump_kb_version()
+    return DeleteResponse(message=f"文档已删除，索引已更新")
+
+
+# =============================================
+# 研究助手 Agent 路由
+# =============================================
+
+@app.post("/agent/ask", response_model=AgentAskResponse)
+async def agent_ask(req: AgentAskRequest):
+    """研究助手 Agent 对话：先查答案级缓存（GPTCache 模式），命中直接返回；
+    未命中走完整 Agent 流程并回写缓存。对话历史按 thread_id 持久化到 PostgreSQL"""
+    from starlette.concurrency import run_in_threadpool
+
+    # 答案级缓存：仅限全新会话的首条消息（多轮对话依赖上下文，不可回放）
+    is_new_thread = not await run_in_threadpool(assistant.thread_exists, req.thread_id)
+    if is_new_thread:
+        cached = get_cached_answer(req.question, req.user_id)
+        if cached is not None:
+            # 命中：跳过整个 Agent 流程，但把问答补进会话历史，后续多轮不断经
+            await run_in_threadpool(
+                assistant.seed_history, req.thread_id, req.user_id, req.question, cached["answer"]
+            )
+            # 回放不消耗 token，usage 置零
+            return AgentAskResponse(
+                answer=cached["answer"], steps=cached.get("steps", []), usage=AgentUsage()
+            )
+
+    try:
+        result = await run_in_threadpool(
+            assistant.ask, req.question, req.thread_id, req.user_id
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Agent 执行失败：{str(e)[:300]}")
+
+    # 回写答案级缓存（只存首条消息的问答，key 带知识库版本号和用户隔离）
+    if is_new_thread:
+        set_cached_answer(req.question, req.user_id, result)
+    return AgentAskResponse(**result)
+
+
+@app.get("/agent/history/{thread_id}", response_model=AgentHistoryResponse)
+async def agent_history(thread_id: str):
+    """读取指定会话的对话历史（来自 PostgresSaver 短期记忆）"""
+    from starlette.concurrency import run_in_threadpool
+
+    messages = await run_in_threadpool(assistant.get_history, thread_id)
+    return AgentHistoryResponse(thread_id=thread_id, messages=messages)
+
+
+@app.get("/agent/threads", response_model=ThreadListResponse)
+async def agent_threads(user_id: str = "default_user"):
+    """列出指定用户的历史会话（按最近活跃时间倒序）"""
+    from starlette.concurrency import run_in_threadpool
+
+    threads = await run_in_threadpool(assistant.list_threads, user_id)
+    return ThreadListResponse(threads=threads)
+
+
+@app.get("/balance", response_model=BalanceResponse)
+async def get_balance():
+    """查询 DeepSeek API 账户余额"""
+    import requests as _requests
+    from starlette.concurrency import run_in_threadpool
+
+    def _fetch():
+        resp = _requests.get(
+            "https://api.deepseek.com/user/balance",
+            headers={"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    try:
+        data = await run_in_threadpool(_fetch)
+        info = (data.get("balance_infos") or [{}])[0]
+        return BalanceResponse(
+            available=data.get("is_available", False),
+            currency=info.get("currency", ""),
+            total_balance=info.get("total_balance", ""),
+        )
+    except Exception:
+        # 余额查询失败不影响主流程，返回不可用状态
+        return BalanceResponse(available=False)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

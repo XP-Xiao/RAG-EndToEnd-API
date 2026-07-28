@@ -1,0 +1,27 @@
+# ===== 敏感信息（绝不上传）=====
+.env
+.env.*
+*.local
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ===== 性能分析产物 =====
+*.svg
+*.prof
+profile.json
+dump.txt
+
+# ===== IDE / 系统 =====
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ===== 运行时数据 =====
+*.log
+output/

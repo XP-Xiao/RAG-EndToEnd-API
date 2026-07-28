@@ -1,0 +1,42 @@
+# 使用 CPU 版 PyTorch（避免下载几百 MB 的 CUDA 库）
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+# FastAPI 后端
+fastapi>=0.115.0
+uvicorn>=0.34.0
+python-dotenv>=1.0.0
+python-multipart>=0.0.6
+
+# LangChain 生态
+langchain>=1.0.0
+langchain-openai>=0.3.0
+langchain-community>=0.3.0
+langchain-huggingface>=0.3.0
+langchain-text-splitters>=0.3.0
+langchain-core>=0.3.0
+
+# 研究助手 Agent（Web 搜索 + Postgres 长短期记忆）
+langchain-tavily>=0.2.0
+langgraph>=1.0.0
+langgraph-checkpoint-postgres>=3.0.0
+psycopg[binary,pool]>=3.2.0
+
+# Redis（LLM 响应缓存，同步 + 异步客户端同属此包）
+redis>=5.0.0
+
+# 向量数据库（Milvus）
+pymilvus>=2.4.0
+langchain-milvus>=0.1.0
+
+# PDF 解析（MinerU 本地 Python API）
+mineru>=2.0.0
+
+# BM25 混合检索
+rank_bm25>=0.2.2
+jieba>=0.42.1
+
+# 网页解析
+beautifulsoup4>=4.12.0
+
+# 嵌入模型（用于预下载）
+sentence-transformers>=3.0.0
