@@ -4,3 +4,6 @@ __pycache__
 .git
 .gitignore
 *.md
+*.svg
+*.prof
+output/

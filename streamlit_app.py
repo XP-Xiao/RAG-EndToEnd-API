@@ -498,9 +498,10 @@ def delete_doc(doc_id: str) -> bool:
         st.error("无法连接后端")
     return False
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_balance():
-    """查询 DeepSeek 余额（60 秒缓存，避免每次 rerun 都请求）"""
+    """查询 DeepSeek 余额（60 秒缓存，避免每次 rerun 都请求；
+    show_spinner=False 关掉页面中间的 'Running fetch_balance()' 提示）"""
     try:
         resp = requests.get(f"{API_URL}/balance", timeout=10)
         if resp.status_code == 200:

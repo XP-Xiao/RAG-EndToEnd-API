@@ -1,6 +1,34 @@
-# docker-compose.yml：同时启动 FastAPI 后端 + Streamlit 前端
+# docker-compose.yml：同时启动 FastAPI 后端 + Streamlit 前端 + PostgreSQL（长短期记忆）+ Redis（缓存）
 # 需要先启动 Milvus：cd milvus && docker-compose up -d
 services:
+  # ---- PostgreSQL（含 pgvector，Agent 长短期记忆）----
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: rag-postgres
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=postgres
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---- Redis（LLM/答案缓存）----
+  redis:
+    image: redis:8
+    container_name: rag-redis
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   # ---- FastAPI 后端 ----
   backend:
     build:
@@ -13,15 +41,22 @@ services:
       - ./.env
     environment:
       - USER_AGENT=RAG-EndToEnd-API/1.0
-      # Docker 环境下覆盖 .env 中的 localhost，改用 Milvus 服务名
+      # Docker 环境下覆盖 .env 中的 localhost，改用各服务名
       - MILVUS_HOST=standalone
       - MILVUS_PORT=19530
+      - DB_URI=postgresql://postgres:postgres@postgres:5432/postgres?sslmode=disable
+      - REDIS_URL=redis://redis:6379/0
       # MinerU 模型缓存路径（挂载本机已有缓存，避免容器内重复下载）
       - MODELSCOPE_CACHE=/models/modelscope
     volumes:
       # 挂载本机 MinerU/ModelScope 模型缓存
       - E:\MODELSCOPE_HUB\.cache\modelscope:/models/modelscope
     command: uvicorn main:app --host 0.0.0.0 --port 8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     networks:
       - default
       - milvus          # 加入 Milvus 所在的外部网络
@@ -52,3 +87,7 @@ networks:
   milvus:
     external: true
     name: milvus
+
+volumes:
+  pg_data:
+  redis_data:

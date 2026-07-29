@@ -20,8 +20,17 @@ REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 LLM_CACHE_TTL = int(os.getenv("LLM_CACHE_TTL", "86400"))  # LLM 响应缓存默认保留 1 天
 ANSWER_CACHE_TTL = int(os.getenv("ANSWER_CACHE_TTL", "86400"))  # 答案级缓存默认保留 1 天
 
-# 同步客户端单例（LLM 缓存与答案级缓存共用）；不可用时保持 None
+# 同步客户端单例（LLM 缓存与同步场景的答案缓存共用）；不可用时保持 None
 _sync_client: redis.Redis | None = None
+
+# 异步客户端单例（路由热路径的答案缓存用）；由 lifespan 通过 set_async_client 注入
+_async_client: aredis.Redis | None = None
+
+
+def set_async_client(client: aredis.Redis) -> None:
+    """lifespan 启动时注入异步客户端，供异步答案缓存函数使用"""
+    global _async_client
+    _async_client = client
 
 
 class SafeRedisCache(RedisCache):
@@ -117,9 +126,58 @@ def set_cached_answer(question: str, user_id: str, result: dict) -> None:
         pass
 
 
+# =============================================
+# 异步版答案缓存（FastAPI 路由热路径专用，不阻塞事件循环）
+# key 规则与同步版完全一致，两套函数读写同一批数据
+# =============================================
+
+async def _a_answer_key(question: str, user_id: str) -> str | None:
+    # 失效逻辑（bump_kb_version）依赖同步客户端：它不可用时旧缓存无法作废，
+    # 异步读写必须一并禁用，否则会回放基于旧知识库的陈旧答案
+    if _async_client is None or _sync_client is None:
+        return None
+    try:
+        # 异步客户端开了 decode_responses，返回的直接是 str
+        ver = await _async_client.get("kb:version") or "0"
+    except Exception:
+        return None
+    qhash = hashlib.md5(f"{user_id}|{question.strip()}".encode("utf-8")).hexdigest()
+    return f"answer:{ver}:{qhash}"
+
+
+async def aget_cached_answer(question: str, user_id: str = "default_user") -> dict | None:
+    """异步查答案缓存：命中返回 {answer, steps}，未命中/异常返回 None"""
+    key = await _a_answer_key(question, user_id)
+    if key is None:
+        return None
+    try:
+        raw = await _async_client.get(key)
+        return json.loads(raw) if raw else None
+    except Exception:
+        return None
+
+
+async def aset_cached_answer(question: str, user_id: str, result: dict) -> None:
+    """异步写答案缓存"""
+    key = await _a_answer_key(question, user_id)
+    if key is None:
+        return
+    try:
+        await _async_client.setex(key, ANSWER_CACHE_TTL, json.dumps(result, ensure_ascii=False))
+    except Exception:
+        pass
+
+
 def create_async_client() -> aredis.Redis:
-    """创建异步客户端（连接池内置），在 lifespan 启动时调用、关闭时 aclose()"""
-    return aredis.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
+    """创建异步客户端（连接池内置），在 lifespan 启动时调用、关闭时 aclose()。
+    超时与同步客户端对齐：否则 Redis 网络黑洞时热路径会无限挂起（except 兜不住挂起）"""
+    return aredis.from_url(
+        REDIS_URL,
+        encoding="utf-8",
+        decode_responses=True,
+        socket_connect_timeout=2,
+        socket_timeout=2,
+    )
 
 
 def get_redis(request: Request) -> aredis.Redis:

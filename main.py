@@ -9,18 +9,28 @@ import os
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 import re
+import sys
+import asyncio
 from contextlib import asynccontextmanager
+
+# Windows 默认 ProactorEventLoop 不被 psycopg 异步模式支持，
+# 必须在事件循环创建前切换为 SelectorEventLoop（psycopg 官方要求）
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 from dotenv import load_dotenv, find_dotenv
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 from rag_engine import RAGEngine
 from agent_engine import ResearchAssistant
 from redis_cache import (
     init_llm_cache,
     create_async_client,
-    get_cached_answer,
-    set_cached_answer,
+    set_async_client,
+    aget_cached_answer,
+    aset_cached_answer,
     bump_kb_version,
 )
 
@@ -39,8 +49,14 @@ async def lifespan(app: FastAPI):
     # 进程重启后 RAG 内存索引已清空，旧答案缓存基于已不存在的知识库，必须作废
     bump_kb_version()
     app.state.redis = create_async_client()
+    # 把异步客户端注入缓存模块，供路由热路径的异步答案缓存使用
+    set_async_client(app.state.redis)
+    # 异步初始化 Agent（AsyncPostgresSaver/Store 必须在事件循环内创建）
+    await assistant.astart()
     yield
-    # 关闭：释放异步连接池
+    # 关闭：释放异步池、同步池（chat_threads 元信息）与 Redis 连接
+    await assistant.apool.close()
+    await asyncio.to_thread(assistant.pool.close)
     await app.state.redis.aclose()
 
 
@@ -169,8 +185,6 @@ async def root():
 @app.post("/upload", response_model=UploadResponse)
 async def upload_document(file: UploadFile = File(...)):
     """上传文档文件（支持 .txt、.md、.pdf），建立向量索引"""
-    from starlette.concurrency import run_in_threadpool
-
     # 检查文件类型
     allowed_types = [".txt", ".md", ".pdf"]
     filename = file.filename or ""
@@ -192,9 +206,9 @@ async def upload_document(file: UploadFile = File(...)):
         # PDF 文件：直接传字节给 MinerU 解析（无需写临时文件）
         chunks = await run_in_threadpool(rag.ingest_pdf, content, filename)
     else:
-        # 文本文件：直接解析
+        # 文本文件：嵌入计算同样耗时，进线程池避免阻塞事件循环
         text = content.decode("utf-8")
-        chunks = rag.ingest_text(text, doc_name=filename)
+        chunks = await run_in_threadpool(rag.ingest_text, text, filename)
 
     # 知识库变更，旧答案缓存失效
     bump_kb_version()
@@ -208,8 +222,9 @@ async def upload_document(file: UploadFile = File(...)):
 
 @app.post("/ask", response_model=AskResponse)
 async def ask_question(req: AskRequest):
-    """根据已上传的文档回答问题"""
-    result = rag.ask(req.question)
+    """根据已上传的文档回答问题（同步 RAG 链含多次 LLM 调用，必须进线程池，
+    否则执行期间整个事件循环被阻塞，所有其他请求卡死）"""
+    result = await run_in_threadpool(rag.ask, req.question)
     return AskResponse(**result)
 
 
@@ -223,7 +238,8 @@ async def upload_from_url(req: URLRequest):
         raise HTTPException(status_code=400, detail="URL 必须以 http:// 或 https:// 开头")
 
     try:
-        chunks = rag.ingest_url(url, doc_name=url)
+        # 网络请求 + 分块 + 嵌入，同步重活进线程池
+        chunks = await run_in_threadpool(rag.ingest_url, url, url)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"无法加载网页内容：{str(e)[:200]}")
 
@@ -249,7 +265,7 @@ async def get_status():
 @app.post("/clear", response_model=ClearResponse)
 async def clear_documents():
     """清空所有文档索引和对话上下文"""
-    rag.clear()
+    await run_in_threadpool(rag.clear)
     bump_kb_version()
     return ClearResponse(message="所有文档索引已清空")
 
@@ -257,7 +273,7 @@ async def clear_documents():
 @app.delete("/documents/{doc_id}", response_model=DeleteResponse)
 async def delete_document(doc_id: str):
     """删除指定文档（同步更新 Milvus 和 BM25 索引）"""
-    success = rag.remove_document(doc_id)
+    success = await run_in_threadpool(rag.remove_document, doc_id)
     if not success:
         raise HTTPException(status_code=404, detail=f"文档 '{doc_id}' 不存在")
     bump_kb_version()
@@ -272,16 +288,14 @@ async def delete_document(doc_id: str):
 async def agent_ask(req: AgentAskRequest):
     """研究助手 Agent 对话：先查答案级缓存（GPTCache 模式），命中直接返回；
     未命中走完整 Agent 流程并回写缓存。对话历史按 thread_id 持久化到 PostgreSQL"""
-    from starlette.concurrency import run_in_threadpool
-
     # 答案级缓存：仅限全新会话的首条消息（多轮对话依赖上下文，不可回放）
     is_new_thread = not await run_in_threadpool(assistant.thread_exists, req.thread_id)
     if is_new_thread:
-        cached = get_cached_answer(req.question, req.user_id)
+        cached = await aget_cached_answer(req.question, req.user_id)
         if cached is not None:
             # 命中：跳过整个 Agent 流程，但把问答补进会话历史，后续多轮不断经
-            await run_in_threadpool(
-                assistant.seed_history, req.thread_id, req.user_id, req.question, cached["answer"]
+            await assistant.aseed_history(
+                req.thread_id, req.user_id, req.question, cached["answer"]
             )
             # 回放不消耗 token，usage 置零
             return AgentAskResponse(
@@ -289,53 +303,44 @@ async def agent_ask(req: AgentAskRequest):
             )
 
     try:
-        result = await run_in_threadpool(
-            assistant.ask, req.question, req.thread_id, req.user_id
-        )
+        # 原生异步：模型 HTTP 调用与 checkpointer/store 均不占线程，同步检索工具由框架自动进 executor
+        result = await assistant.aask(req.question, req.thread_id, req.user_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Agent 执行失败：{str(e)[:300]}")
 
     # 回写答案级缓存（只存首条消息的问答，key 带知识库版本号和用户隔离）
     if is_new_thread:
-        set_cached_answer(req.question, req.user_id, result)
+        await aset_cached_answer(req.question, req.user_id, result)
     return AgentAskResponse(**result)
 
 
 @app.get("/agent/history/{thread_id}", response_model=AgentHistoryResponse)
 async def agent_history(thread_id: str):
-    """读取指定会话的对话历史（来自 PostgresSaver 短期记忆）"""
-    from starlette.concurrency import run_in_threadpool
-
-    messages = await run_in_threadpool(assistant.get_history, thread_id)
+    """读取指定会话的对话历史（来自 AsyncPostgresSaver 短期记忆）"""
+    messages = await assistant.aget_history(thread_id)
     return AgentHistoryResponse(thread_id=thread_id, messages=messages)
 
 
 @app.get("/agent/threads", response_model=ThreadListResponse)
 async def agent_threads(user_id: str = "default_user"):
     """列出指定用户的历史会话（按最近活跃时间倒序）"""
-    from starlette.concurrency import run_in_threadpool
-
     threads = await run_in_threadpool(assistant.list_threads, user_id)
     return ThreadListResponse(threads=threads)
 
 
 @app.get("/balance", response_model=BalanceResponse)
 async def get_balance():
-    """查询 DeepSeek API 账户余额"""
-    import requests as _requests
-    from starlette.concurrency import run_in_threadpool
-
-    def _fetch():
-        resp = _requests.get(
-            "https://api.deepseek.com/user/balance",
-            headers={"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        return resp.json()
+    """查询 DeepSeek API 账户余额（httpx 原生异步，不占线程）"""
+    import httpx
 
     try:
-        data = await run_in_threadpool(_fetch)
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                "https://api.deepseek.com/user/balance",
+                headers={"Authorization": f"Bearer {os.getenv('DEEPSEEK_API_KEY')}"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
         info = (data.get("balance_infos") or [{}])[0]
         return BalanceResponse(
             available=data.get("is_available", False),
@@ -349,4 +354,7 @@ async def get_balance():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # loop="none"：uvicorn 0.36+ 在 Windows 上默认硬编码 ProactorEventLoop（无视策略），
+    # 会导致 psycopg 异步池报错；置 none 后回退到 asyncio.new_event_loop()，
+    # 从而尊重文件顶部设置的 WindowsSelectorEventLoopPolicy
+    uvicorn.run(app, host="0.0.0.0", port=8000, loop="none")

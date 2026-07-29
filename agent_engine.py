@@ -1,22 +1,23 @@
 """
-研究助手 Agent 引擎：基于 LangChain 官方 create_agent 构建
+研究助手 Agent 引擎：基于 LangChain 官方 create_agent 构建（原生异步）
 - 工具：知识库检索（复用 RAGEngine 混合检索 + 重排）、Tavily Web 搜索、长期记忆读写
-- 短期记忆：PostgresSaver（checkpointer，按 thread_id 持久化对话历史）
-- 长期记忆：PostgresStore（跨会话存储用户事实，pgvector 语义检索）
+- 短期记忆：AsyncPostgresSaver（checkpointer，按 thread_id 持久化对话历史）
+- 长期记忆：AsyncPostgresStore（跨会话存储用户事实，pgvector 语义检索）
 """
 import os
 import uuid
+import asyncio
 from dataclasses import dataclass
 
 from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool
+from psycopg_pool import ConnectionPool, AsyncConnectionPool
 from langchain.agents import create_agent
 from langchain.tools import tool, ToolRuntime
 from langchain_openai import ChatOpenAI
 from langchain_tavily import TavilySearch
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-from langgraph.checkpoint.postgres import PostgresSaver
-from langgraph.store.postgres import PostgresStore
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.store.postgres.aio import AsyncPostgresStore
 
 from rag_engine import RAGEngine
 
@@ -48,15 +49,19 @@ class AgentContext:
 
 
 class ResearchAssistant:
-    """研究助手：create_agent + PostgresSaver（短期）+ PostgresStore（长期）"""
+    """研究助手：create_agent + AsyncPostgresSaver（短期）+ AsyncPostgresStore（长期）
+
+    两段式初始化：__init__ 只做同步准备（元信息表、LLM）；
+    astart() 在事件循环内建异步池/存储并组装 agent（lifespan 中调用）。
+    """
 
     def __init__(self, rag: RAGEngine):
         self.rag = rag
 
-        # 连接池：PostgresSaver/PostgresStore 要求 autocommit + dict_row
+        # 同步连接池：只用于 chat_threads 元信息表（线程池里跑的轻量 SQL）
         self.pool = ConnectionPool(
             conninfo=DB_URI,
-            max_size=10,
+            max_size=5,
             kwargs={
                 "autocommit": True,
                 "prepare_threshold": 0,
@@ -77,26 +82,49 @@ class ResearchAssistant:
                 )"""
             )
 
-        # 短期记忆：按 thread_id 持久化对话历史（checkpointer）
-        self.checkpointer = PostgresSaver(self.pool)
-        self.checkpointer.setup()
-
-        # 长期记忆：跨会话存储，复用 RAG 的嵌入模型做语义检索（MiniLM-L6 = 384 维）
-        self.store = PostgresStore(
-            self.pool,
-            index={"dims": 384, "embed": rag.embeddings},
-        )
-        self.store.setup()
-
-        llm = ChatOpenAI(
+        self._llm = ChatOpenAI(
             model="deepseek-v4-flash",
             api_key=os.getenv("DEEPSEEK_API_KEY"),
             base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
             temperature=0.2,
         )
 
+        # 异步部分在 astart() 里初始化
+        self.apool: AsyncConnectionPool | None = None
+        self.checkpointer: AsyncPostgresSaver | None = None
+        self.store: AsyncPostgresStore | None = None
+        self.agent = None
+
+    async def astart(self) -> None:
+        """异步初始化（必须在事件循环内调用，如 FastAPI lifespan）：
+        异步连接池 + AsyncPostgresSaver/Store + create_agent。
+        同步版 PostgresSaver 不支持 ainvoke（aget_tuple 抛 NotImplementedError），
+        因此原生异步必须用 aio 版本。"""
+        self.apool = AsyncConnectionPool(
+            conninfo=DB_URI,
+            max_size=10,
+            open=False,
+            kwargs={
+                "autocommit": True,
+                "prepare_threshold": 0,
+                "row_factory": dict_row,
+            },
+        )
+        await self.apool.open()
+
+        # 短期记忆：按 thread_id 持久化对话历史（checkpointer）
+        self.checkpointer = AsyncPostgresSaver(self.apool)
+        await self.checkpointer.setup()
+
+        # 长期记忆：跨会话存储，复用 RAG 的嵌入模型做语义检索（MiniLM-L6 = 384 维）
+        self.store = AsyncPostgresStore(
+            self.apool,
+            index={"dims": 384, "embed": self.rag.embeddings},
+        )
+        await self.store.setup()
+
         self.agent = create_agent(
-            model=llm,
+            model=self._llm,
             tools=self._build_tools(),
             system_prompt=SYSTEM_PROMPT,
             context_schema=AgentContext,
@@ -148,25 +176,26 @@ class ResearchAssistant:
                 return "Web 搜索不可用：服务端未配置 TAVILY_API_KEY。请基于知识库或已有知识回答，并告知用户搜索功能暂不可用。"
 
         @tool
-        def save_memory(content: str, runtime: ToolRuntime[AgentContext]) -> str:
+        async def save_memory(content: str, runtime: ToolRuntime[AgentContext]) -> str:
             """保存关于用户的长期记忆（姓名、职业、研究方向、偏好等值得跨会话记住的事实）。
 
             Args:
                 content: 一条简洁的事实描述，例如"用户叫小明，研究方向是多模态大模型"
             """
+            # AsyncPostgresStore 只支持异步方法，工具相应改为 async（异步 Agent 下原生 await）
             namespace = ("memories", runtime.context.user_id)
-            runtime.store.put(namespace, str(uuid.uuid4()), {"content": content})
+            await runtime.store.aput(namespace, str(uuid.uuid4()), {"content": content})
             return f"已保存长期记忆：{content}"
 
         @tool
-        def search_memories(query: str, runtime: ToolRuntime[AgentContext]) -> str:
+        async def search_memories(query: str, runtime: ToolRuntime[AgentContext]) -> str:
             """检索关于当前用户的长期记忆，用于回答涉及用户个人情况、偏好的问题。
 
             Args:
                 query: 检索查询，例如"用户的研究方向"
             """
             namespace = ("memories", runtime.context.user_id)
-            items = runtime.store.search(namespace, query=query, limit=5)
+            items = await runtime.store.asearch(namespace, query=query, limit=5)
             if not items:
                 return "没有找到相关的长期记忆。"
             return "\n".join(f"- {item.value['content']}" for item in items)
@@ -177,16 +206,8 @@ class ResearchAssistant:
     # 对外接口
     # =============================================
 
-    def ask(self, question: str, thread_id: str, user_id: str = "default_user") -> dict:
-        """执行一轮 Agent 对话，返回答案和工具调用轨迹"""
-        config = {"configurable": {"thread_id": thread_id}}
-        result = self.agent.invoke(
-            {"messages": [{"role": "user", "content": question}]},
-            config=config,
-            context=AgentContext(user_id=user_id),
-        )
-
-        # 注册/刷新会话元信息（首次提问作为会话标题，供历史会话列表展示）
+    def _register_thread(self, thread_id: str, user_id: str, question: str) -> None:
+        """注册/刷新会话元信息（首次提问作为会话标题，供历史会话列表展示）"""
         with self.pool.connection() as conn:
             conn.execute(
                 """INSERT INTO chat_threads (thread_id, user_id, title)
@@ -195,9 +216,10 @@ class ResearchAssistant:
                 (thread_id, user_id, question[:50]),
             )
 
-        # 提取本轮的工具调用轨迹（checkpointer 会把历史消息一并返回，
-        # 只取最后一条用户消息之后的部分，供前端展示 Agent 本轮推理过程）
-        messages = result["messages"]
+    @staticmethod
+    def _extract_result(messages: list) -> dict:
+        """从完整消息列表中提取本轮的答案、工具轨迹和 token 用量
+        （checkpointer 会把历史消息一并返回，只取最后一条用户消息之后的部分）"""
         last_human_idx = max(
             (i for i, m in enumerate(messages) if isinstance(m, HumanMessage)),
             default=-1,
@@ -225,6 +247,22 @@ class ResearchAssistant:
         answer = messages[-1].text if messages else ""
         return {"answer": answer, "steps": steps, "usage": usage}
 
+    async def aask(self, question: str, thread_id: str, user_id: str = "default_user") -> dict:
+        """异步执行一轮 Agent 对话（FastAPI 路由专用）。
+
+        ainvoke 下：模型 HTTP 请求走原生异步（AsyncOpenAI），checkpointer/store 也是原生异步；
+        同步的检索工具由 LangChain 自动放入 executor 线程池。
+        """
+        config = {"configurable": {"thread_id": thread_id}}
+        result = await self.agent.ainvoke(
+            {"messages": [{"role": "user", "content": question}]},
+            config=config,
+            context=AgentContext(user_id=user_id),
+        )
+        # psycopg 同步写库，丢进线程避免阻塞事件循环
+        await asyncio.to_thread(self._register_thread, thread_id, user_id, question)
+        return self._extract_result(result["messages"])
+
     def thread_exists(self, thread_id: str) -> bool:
         """判断会话是否已有历史（答案级缓存只对全新会话的首条消息生效）"""
         with self.pool.connection() as conn:
@@ -233,24 +271,18 @@ class ResearchAssistant:
             ).fetchone()
         return row is not None
 
-    def seed_history(self, thread_id: str, user_id: str, question: str, answer: str) -> None:
+    async def aseed_history(self, thread_id: str, user_id: str, question: str, answer: str) -> None:
         """答案级缓存命中时调用：把问答写入该会话的 checkpoint 历史，
-        保证后续多轮对话上下文连续，并注册会话元信息"""
+        保证后续多轮对话上下文连续，并注册会话元信息（异步 checkpointer 用 aupdate_state）"""
         config = {"configurable": {"thread_id": thread_id}}
-        self.agent.update_state(
+        await self.agent.aupdate_state(
             config,
             {"messages": [
                 HumanMessage(content=question),
                 AIMessage(content=answer),
             ]},
         )
-        with self.pool.connection() as conn:
-            conn.execute(
-                """INSERT INTO chat_threads (thread_id, user_id, title)
-                   VALUES (%s, %s, %s)
-                   ON CONFLICT (thread_id) DO UPDATE SET updated_at = now()""",
-                (thread_id, user_id, question[:50]),
-            )
+        await asyncio.to_thread(self._register_thread, thread_id, user_id, question)
 
     def list_threads(self, user_id: str = "default_user") -> list[dict]:
         """列出该用户的历史会话（按最近活跃时间倒序）"""
@@ -269,10 +301,10 @@ class ResearchAssistant:
             for r in rows
         ]
 
-    def get_history(self, thread_id: str) -> list[dict]:
-        """从 PostgresSaver 读取指定会话的对话历史（供前端恢复会话）"""
+    async def aget_history(self, thread_id: str) -> list[dict]:
+        """从 AsyncPostgresSaver 读取指定会话的对话历史（供前端恢复会话）"""
         config = {"configurable": {"thread_id": thread_id}}
-        state = self.agent.get_state(config)
+        state = await self.agent.aget_state(config)
         messages = state.values.get("messages", []) if state.values else []
 
         history = []

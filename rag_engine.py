@@ -7,6 +7,7 @@ import os
 import re
 import json
 import uuid
+import threading
 from langchain_milvus import Milvus
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import (
@@ -70,6 +71,9 @@ class RAGEngine:
         # Milvus 向量数据库（初始为 None，上传文档后创建）
         self.vectorstore = None
         self.retriever = None
+        # 索引写操作互斥锁：写接口均在线程池中真并发执行，
+        # 不加锁时并发首次上传会双双走 drop_old=True 互相覆盖数据
+        self._index_lock = threading.Lock()
         # Milvus 连接配置
         self._milvus_connection_args = {
             "host": os.getenv("MILVUS_HOST", "localhost"),
@@ -123,34 +127,35 @@ class RAGEngine:
             self._bm25_retriever = None
 
     def _add_to_index(self, splits: list, doc_name: str) -> int:
-        """将文档块添加到 Milvus 向量索引和 BM25 索引，返回文档块数"""
-        doc_id = str(uuid.uuid4())[:8]
+        """将文档块添加到 Milvus 向量索引和 BM25 索引，返回文档块数（线程安全）"""
+        with self._index_lock:
+            doc_id = str(uuid.uuid4())[:8]
 
-        # 给每个 chunk 添加元数据
-        for split in splits:
-            split.metadata["doc_id"] = doc_id
-            split.metadata["doc_name"] = doc_name
+            # 给每个 chunk 添加元数据
+            for split in splits:
+                split.metadata["doc_id"] = doc_id
+                split.metadata["doc_name"] = doc_name
 
-        # 建立/追加 Milvus 向量索引
-        if self.vectorstore is None:
-            self.vectorstore = Milvus.from_documents(
-                documents=splits,
-                embedding=self.embeddings,
-                collection_name=self._collection_name,
-                connection_args=self._milvus_connection_args,
-                drop_old=True,
-            )
-        else:
-            self.vectorstore.add_documents(splits)
+            # 建立/追加 Milvus 向量索引
+            if self.vectorstore is None:
+                self.vectorstore = Milvus.from_documents(
+                    documents=splits,
+                    embedding=self.embeddings,
+                    collection_name=self._collection_name,
+                    connection_args=self._milvus_connection_args,
+                    drop_old=True,
+                )
+            else:
+                self.vectorstore.add_documents(splits)
 
-        # 更新 BM25
-        self._update_bm25(splits)
+            # 更新 BM25
+            self._update_bm25(splits)
 
-        # 记录文档
-        self._docs[doc_id] = {"name": doc_name, "chunks": len(splits)}
+            # 记录文档
+            self._docs[doc_id] = {"name": doc_name, "chunks": len(splits)}
 
-        self.retriever = self.vectorstore.as_retriever(search_kwargs={"k": 10})
-        return len(splits)
+            self.retriever = self.vectorstore.as_retriever(search_kwargs={"k": 10})
+            return len(splits)
 
     # =============================================
     # 内部方法：检索
@@ -193,59 +198,61 @@ class RAGEngine:
     # =============================================
 
     def remove_document(self, doc_id: str) -> bool:
-        """删除指定文档（同步更新 Milvus 和 BM25）"""
-        if doc_id not in self._docs:
-            return False
+        """删除指定文档（同步更新 Milvus 和 BM25，线程安全）"""
+        with self._index_lock:
+            if doc_id not in self._docs:
+                return False
 
-        # 从 Milvus 中删除该文档的所有向量
-        try:
-            from pymilvus import connections, Collection
-            connections.connect(
-                alias="rag_delete",
-                host=self._milvus_connection_args["host"],
-                port=self._milvus_connection_args["port"],
-            )
-            col = Collection(self._collection_name, using="rag_delete")
-            col.delete(expr=f'doc_id == "{doc_id}"')
-            connections.disconnect("rag_delete")
-        except Exception:
-            pass  # Milvus 删除失败不阻塞本地清理
+            # 从 Milvus 中删除该文档的所有向量
+            try:
+                from pymilvus import connections, Collection
+                connections.connect(
+                    alias="rag_delete",
+                    host=self._milvus_connection_args["host"],
+                    port=self._milvus_connection_args["port"],
+                )
+                col = Collection(self._collection_name, using="rag_delete")
+                col.delete(expr=f'doc_id == "{doc_id}"')
+                connections.disconnect("rag_delete")
+            except Exception:
+                pass  # Milvus 删除失败不阻塞本地清理
 
-        # 从本地追踪中移除
-        self._docs.pop(doc_id)
+            # 从本地追踪中移除
+            self._docs.pop(doc_id)
 
-        # 从内存文档列表中移除该文档的所有 chunk
-        self._all_documents = [
-            d for d in self._all_documents
-            if d.metadata.get("doc_id") != doc_id
-        ]
+            # 从内存文档列表中移除该文档的所有 chunk
+            self._all_documents = [
+                d for d in self._all_documents
+                if d.metadata.get("doc_id") != doc_id
+            ]
 
-        # 重建 BM25
-        self._rebuild_bm25()
+            # 重建 BM25
+            self._rebuild_bm25()
 
-        return True
+            return True
 
     def clear(self):
-        """清空所有文档索引、检索器和文档记录"""
-        # 尝试删除 Milvus collection
-        try:
-            from pymilvus import connections, utility
-            connections.connect(
-                alias="rag_clear",
-                host=self._milvus_connection_args["host"],
-                port=self._milvus_connection_args["port"],
-            )
-            if utility.has_collection(self._collection_name, using="rag_clear"):
-                utility.drop_collection(self._collection_name, using="rag_clear")
-            connections.disconnect("rag_clear")
-        except Exception:
-            pass
+        """清空所有文档索引、检索器和文档记录（线程安全）"""
+        with self._index_lock:
+            # 尝试删除 Milvus collection
+            try:
+                from pymilvus import connections, utility
+                connections.connect(
+                    alias="rag_clear",
+                    host=self._milvus_connection_args["host"],
+                    port=self._milvus_connection_args["port"],
+                )
+                if utility.has_collection(self._collection_name, using="rag_clear"):
+                    utility.drop_collection(self._collection_name, using="rag_clear")
+                connections.disconnect("rag_clear")
+            except Exception:
+                pass
 
-        self.vectorstore = None
-        self.retriever = None
-        self._all_documents = []
-        self._bm25_retriever = None
-        self._docs = {}
+            self.vectorstore = None
+            self.retriever = None
+            self._all_documents = []
+            self._bm25_retriever = None
+            self._docs = {}
 
     def get_status(self) -> dict:
         """获取当前文档索引状态"""
