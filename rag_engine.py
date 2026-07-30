@@ -30,6 +30,13 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+# Reranker 批处理参数：将候选文档拆成小批并发打分（而非一个超大 prompt）
+# 小批：prompt 更短 → LLM 输出更快、JSON 格式遵循度更高；并发：多批同时调用抄低总延迟
+RERANK_BATCH_SIZE = 5      # 每批文档数
+RERANK_MAX_CONCURRENCY = 5  # 最大并发批数
+RERANK_NEUTRAL_SCORE = 5.0  # 某批解析失败时的中性分（保留该批而非丢弃）
+
+
 class RAGEngine:
     """端到端 RAG 引擎：上传文档 → 建索引 → 混合检索 → LLM 重排 → 回答"""
 
@@ -174,23 +181,52 @@ class RAGEngine:
                 merged.append(doc)
         return merged
 
-    def _llm_rerank(self, docs: list, question: str, top_n: int = 5) -> list:
-        """LLM Reranker：对检索到的文档进行打分重排序"""
-        doc_texts = ""
-        for i, doc in enumerate(docs):
-            doc_texts += f"\n[Doc {i + 1}]\n{doc.page_content}\n"
-
-        chain = self._rerank_prompt | self.llm | StrOutputParser()
-        result = chain.invoke({"question": question, "documents": doc_texts})
-
+    @staticmethod
+    def _parse_scores(result: str, expected: int) -> list[float]:
+        """从单批 LLM 输出中解析分数，并对齐到 expected 个（不足补中性分、超出截断）。
+        解析失败时返回全中性分，保证该批文档仍参与排序而不是静默丢弃"""
         try:
             start = result.find("{")
             end = result.rfind("}") + 1
             scores = json.loads(result[start:end])["scores"]
-        except (json.JSONDecodeError, KeyError, ValueError):
-            return docs[:top_n]
+            scores = [float(s) for s in scores]
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+            return [RERANK_NEUTRAL_SCORE] * expected
+        # 对齐数量：防止 LLM 返回的分数个数与文档数不一致导致后续 zip 错位
+        if len(scores) < expected:
+            scores += [RERANK_NEUTRAL_SCORE] * (expected - len(scores))
+        return scores[:expected]
 
-        scored_docs = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
+    def _llm_rerank(self, docs: list, question: str, top_n: int = 5) -> list:
+        """LLM Reranker：将文档拆成小批并发打分后重排序。
+        相较单个超大 prompt：延迟更低（并发）、JSON 更稳（短 prompt）、
+        某批解析失败不会拖垓其他批（逐批容错）"""
+        if not docs:
+            return []
+
+        # 拆分成小批，每批独立拼成一个打分请求
+        batches = [docs[i:i + RERANK_BATCH_SIZE] for i in range(0, len(docs), RERANK_BATCH_SIZE)]
+        inputs = []
+        for batch in batches:
+            doc_texts = "".join(
+                f"\n[Doc {i + 1}]\n{doc.page_content}\n" for i, doc in enumerate(batch)
+            )
+            inputs.append({"question": question, "documents": doc_texts})
+
+        chain = self._rerank_prompt | self.llm | StrOutputParser()
+
+        # 单批时直接 invoke；多批时 batch 并发（max_concurrency 限制同时请求数）
+        if len(inputs) == 1:
+            results = [chain.invoke(inputs[0])]
+        else:
+            results = chain.batch(inputs, config={"max_concurrency": RERANK_MAX_CONCURRENCY})
+
+        # 逐批解析并拼回全量分数，与 docs 严格一一对应
+        all_scores = []
+        for batch, result in zip(batches, results):
+            all_scores.extend(self._parse_scores(result, len(batch)))
+
+        scored_docs = sorted(zip(all_scores, docs), key=lambda x: x[0], reverse=True)
         return [doc for _, doc in scored_docs[:top_n]]
 
     # =============================================
