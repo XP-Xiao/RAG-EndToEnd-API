@@ -7,3 +7,8 @@ __pycache__
 *.svg
 *.prof
 output/
+*.log
+monitoring/
+docker-compose.yml
+Dockerfile.backend
+Dockerfile.frontend

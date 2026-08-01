@@ -1,7 +1,8 @@
 # ============================================
 # RAG-EndToEnd-API 前端 Docker 镜像（Streamlit）
 # ============================================
-FROM python:3.11-slim
+# 基础镜像固定 digest，保证构建可复现
+FROM python:3.11-slim@sha256:00af38ae2ed311628970782e8a2d7f014d8909dbc63cb97bc0a158187f4db045
 
 WORKDIR /app
 

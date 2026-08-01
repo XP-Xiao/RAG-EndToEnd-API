@@ -1,18 +1,29 @@
 # ============================================
 # RAG-EndToEnd-API 后端 Docker 镜像（FastAPI）
+# 多阶段构建：builder 阶段安装依赖（含编译工具），runtime 阶段只保留运行所需
 # ============================================
-FROM python:3.11-slim
 
-WORKDIR /app
+# 基础镜像固定 digest，保证构建可复现（同一 digest 内容永不漂移）
+FROM python:3.11-slim@sha256:00af38ae2ed311628970782e8a2d7f014d8909dbc63cb97bc0a158187f4db045 AS builder
 
-# 系统依赖（sentence-transformers 编译可能需要）
+WORKDIR /build
+
+# 系统依赖（仅 builder 阶段使用，最终镜像不包含）
 RUN apt-get update \
     && apt-get install -y --fix-missing --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# 安装 Python 依赖（requirements 中已声明 CPU 版 PyTorch 源）
+# 安装 Python 依赖（requirements 中已声明 CPU 版 PyTorch 源 + 锁定版本）
 COPY requirements-backend.txt .
 RUN pip install --no-cache-dir -r requirements-backend.txt
+
+# ============ 运行阶段 ============
+FROM python:3.11-slim@sha256:00af38ae2ed311628970782e8a2d7f014d8909dbc63cb97bc0a158187f4db045
+
+WORKDIR /app
+
+# 只复制已安装的依赖包（编译工具与 apt 残留不进入最终镜像）
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
 
 # 预下载 HuggingFace 嵌入模型（运行时 local_files_only=True 即可工作）
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
@@ -25,4 +36,5 @@ ENV USER_AGENT="RAG-EndToEnd-API/1.0"
 
 EXPOSE 8000
 
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# 用 python -m 方式启动（未复制 console 脚本入口，uvicorn 以模块方式调用）
+CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
