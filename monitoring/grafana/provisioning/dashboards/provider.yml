@@ -1,0 +1,12 @@
+# Grafana 仪表盘自动装配：扫描 dashboards 目录下的 JSON 文件自动加载
+apiVersion: 1
+
+providers:
+  - name: RAG Dashboards
+    folder: ""                    # 放在 Grafana 根目录
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30     # 每 30 秒重新扫描（改 JSON 后自动生效）
+    allowUiUpdates: true          # 允许在 UI 里编辑后保存
+    options:
+      path: /var/lib/grafana/dashboards

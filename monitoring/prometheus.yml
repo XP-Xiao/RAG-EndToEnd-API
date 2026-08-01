@@ -1,0 +1,17 @@
+# Prometheus 抓取配置
+# 两个 job 覆盖两种运行方式：后端跑在 Docker 里走服务名，跑在宿主机（python main.py）走 host.docker.internal
+# 未运行的那个 target 会显示 down，不影响另一个正常抓取
+global:
+  scrape_interval: 15s   # 每 15 秒抓一次 /metrics
+  evaluation_interval: 15s
+
+scrape_configs:
+  # 后端以 Docker 方式运行（docker-compose up backend）
+  - job_name: rag-backend-docker
+    static_configs:
+      - targets: ["backend:8000"]
+
+  # 后端在宿主机直接运行（python main.py，日常开发调试）
+  - job_name: rag-backend-host
+    static_configs:
+      - targets: ["host.docker.internal:8000"]

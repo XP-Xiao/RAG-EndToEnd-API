@@ -1,34 +1,10 @@
-# docker-compose.yml：同时启动 FastAPI 后端 + Streamlit 前端 + PostgreSQL（长短期记忆）+ Redis（缓存）
-# 需要先启动 Milvus：cd milvus && docker-compose up -d
+# docker-compose.yml：只打包应用层（FastAPI 后端 + Streamlit 前端 + Prometheus + Grafana）
+# 外部依赖需先启动（全部就绪后再 up 本项目）：
+#   1. PostgreSQL（本机服务，含 pgvector 扩展，监听 5432）
+#   2. Redis（本机 redis74 容器，映射 6379）
+#   3. Milvus：cd milvus && docker-compose up -d（创建外部网络 milvus）
+# backend 通过 host.docker.internal 访问宿主机上的 PostgreSQL/Redis，通过外部网络 milvus 直达 Milvus
 services:
-  # ---- PostgreSQL（含 pgvector，Agent 长短期记忆）----
-  postgres:
-    image: pgvector/pgvector:pg16
-    container_name: rag-postgres
-    environment:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
-      - POSTGRES_DB=postgres
-    volumes:
-      - pg_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
-  # ---- Redis（LLM/答案缓存）----
-  redis:
-    image: redis:8
-    container_name: rag-redis
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
   # ---- FastAPI 后端 ----
   backend:
     build:
@@ -41,25 +17,23 @@ services:
       - ./.env
     environment:
       - USER_AGENT=RAG-EndToEnd-API/1.0
-      # Docker 环境下覆盖 .env 中的 localhost，改用各服务名
+      # 外部依赖：PostgreSQL/Redis 走宿主机（host.docker.internal），Milvus 走外部网络服务名
       - MILVUS_HOST=standalone
       - MILVUS_PORT=19530
-      - DB_URI=postgresql://postgres:postgres@postgres:5432/postgres?sslmode=disable
-      - REDIS_URL=redis://redis:6379/0
+      - DB_URI=postgresql://postgres:postgres@host.docker.internal:5432/postgres?sslmode=disable
+      - REDIS_URL=redis://host.docker.internal:6379/0
       # MinerU 模型缓存路径（挂载本机已有缓存，避免容器内重复下载）
       - MODELSCOPE_CACHE=/models/modelscope
     volumes:
       # 挂载本机 MinerU/ModelScope 模型缓存
       - E:\MODELSCOPE_HUB\.cache\modelscope:/models/modelscope
     command: uvicorn main:app --host 0.0.0.0 --port 8000
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
     networks:
       - default
       - milvus          # 加入 Milvus 所在的外部网络
+    extra_hosts:
+      # 保证 host.docker.internal 可解析到宿主机（Linux 引擎下也生效）
+      - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
       interval: 10s
@@ -82,6 +56,38 @@ services:
       backend:
         condition: service_healthy
 
+  # ---- Prometheus（指标采集存储，每 15s 抓后端 /metrics）----
+  # 单独起监控（后端在宿主机 python main.py 运行）：docker-compose up -d prometheus grafana
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: rag-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    extra_hosts:
+      # Linux 引擎下也能解析 host.docker.internal（抓宿主机上直接跑的后端）
+      - "host.docker.internal:host-gateway"
+
+  # ---- Grafana（可视化大盘，自动装配数据源和仪表盘）----
+  grafana:
+    image: grafana/grafana:latest
+    container_name: rag-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      # 本地开发免登录，直接以管理员身份进入
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
 # Milvus 部署创建的外部网络，必须先启动 Milvus（cd milvus && docker-compose up -d）
 networks:
   milvus:
@@ -89,5 +95,5 @@ networks:
     name: milvus
 
 volumes:
-  pg_data:
-  redis_data:
+  prometheus_data:
+  grafana_data:

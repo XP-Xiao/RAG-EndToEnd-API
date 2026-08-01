@@ -15,6 +15,7 @@ import redis.asyncio as aredis
 from fastapi import Request
 from langchain_core.globals import set_llm_cache
 from langchain_community.cache import RedisCache
+from metrics import LLM_CACHE_TOTAL
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 LLM_CACHE_TTL = int(os.getenv("LLM_CACHE_TTL", "86400"))  # LLM 响应缓存默认保留 1 天
@@ -38,9 +39,12 @@ class SafeRedisCache(RedisCache):
 
     def lookup(self, prompt, llm_string):
         try:
-            return super().lookup(prompt, llm_string)
+            result = super().lookup(prompt, llm_string)
         except Exception:
-            return None
+            result = None
+        # 命中率埋点：异常降级也计入 miss（对调用方而言效果等同未命中）
+        LLM_CACHE_TOTAL.labels(result="hit" if result is not None else "miss").inc()
+        return result
 
     def update(self, prompt, llm_string, return_val):
         try:

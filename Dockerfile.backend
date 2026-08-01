@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir -r requirements-backend.txt
 RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
 
 # 只复制后端所需代码（不需要 streamlit_app.py）
-COPY main.py rag_engine.py agent_engine.py redis_cache.py ./
+COPY main.py rag_engine.py agent_engine.py redis_cache.py metrics.py ./
 
 ENV DEEPSEEK_API_KEY=""
 ENV USER_AGENT="RAG-EndToEnd-API/1.0"

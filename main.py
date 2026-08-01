@@ -10,6 +10,7 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 import re
 import sys
+import time
 import asyncio
 from contextlib import asynccontextmanager
 
@@ -23,6 +24,8 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
+from prometheus_fastapi_instrumentator import Instrumentator
+from metrics import ANSWER_CACHE_TOTAL, AGENT_ASK_SECONDS, LLM_TOKENS_TOTAL
 from rag_engine import RAGEngine
 from agent_engine import ResearchAssistant
 from redis_cache import (
@@ -70,6 +73,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Prometheus HTTP 层自动埋点：QPS/耗时/状态码按路由分维度，暴露 /metrics 端点。
+# 业务指标（metrics.py 定义）注册在同一个全局 Registry，也从这个端点吐出
+Instrumentator(
+    excluded_handlers=["/metrics"],  # 抓取端点自身不计入请求指标
+).instrument(app).expose(app, include_in_schema=False)
 
 # 全局 RAG 引擎实例
 rag = RAGEngine()
@@ -292,6 +301,7 @@ async def agent_ask(req: AgentAskRequest):
     is_new_thread = not await run_in_threadpool(assistant.thread_exists, req.thread_id)
     if is_new_thread:
         cached = await aget_cached_answer(req.question, req.user_id)
+        ANSWER_CACHE_TOTAL.labels(result="hit" if cached is not None else "miss").inc()
         if cached is not None:
             # 命中：跳过整个 Agent 流程，但把问答补进会话历史，后续多轮不断经
             await assistant.aseed_history(
@@ -304,9 +314,17 @@ async def agent_ask(req: AgentAskRequest):
 
     try:
         # 原生异步：模型 HTTP 调用与 checkpointer/store 均不占线程，同步检索工具由框架自动进 executor
+        start = time.perf_counter()
         result = await assistant.aask(req.question, req.thread_id, req.user_id)
+        AGENT_ASK_SECONDS.observe(time.perf_counter() - start)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Agent 执行失败：{str(e)[:300]}")
+
+    # token 用量计入监控（回放缓存不走到这里，统计的都是真实消耗）
+    usage = result.get("usage", {})
+    LLM_TOKENS_TOTAL.labels(type="input").inc(usage.get("input_tokens", 0))
+    LLM_TOKENS_TOTAL.labels(type="output").inc(usage.get("output_tokens", 0))
+    LLM_TOKENS_TOTAL.labels(type="cache_hit").inc(usage.get("cache_hit_tokens", 0))
 
     # 回写答案级缓存（只存首条消息的问答，key 带知识库版本号和用户隔离）
     if is_new_thread:

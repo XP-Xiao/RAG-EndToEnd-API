@@ -20,6 +20,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
 from langchain_openai import ChatOpenAI
 from langchain_community.retrievers import BM25Retriever
+from metrics import RAG_STAGE_SECONDS, KB_DOCUMENTS, KB_CHUNKS
 
 
 def clean_text(text: str) -> str:
@@ -162,6 +163,9 @@ class RAGEngine:
             self._docs[doc_id] = {"name": doc_name, "chunks": len(splits)}
 
             self.retriever = self.vectorstore.as_retriever(search_kwargs={"k": 10})
+            # 知识库规模指标（Gauge 直接取当前真实值，不累加）
+            KB_DOCUMENTS.set(len(self._docs))
+            KB_CHUNKS.set(len(self._all_documents))
             return len(splits)
 
     # =============================================
@@ -170,16 +174,17 @@ class RAGEngine:
 
     def _hybrid_retrieve(self, query: str) -> list:
         """BM25 + Embedding 混合检索，合并去重"""
-        bm25_docs = self._bm25_retriever.invoke(query) if self._bm25_retriever else []
-        embedding_docs = self.retriever.invoke(query) if self.retriever else []
+        with RAG_STAGE_SECONDS.labels(stage="hybrid_retrieve").time():
+            bm25_docs = self._bm25_retriever.invoke(query) if self._bm25_retriever else []
+            embedding_docs = self.retriever.invoke(query) if self.retriever else []
 
-        seen = set()
-        merged = []
-        for doc in bm25_docs + embedding_docs:
-            if doc.page_content not in seen:
-                seen.add(doc.page_content)
-                merged.append(doc)
-        return merged
+            seen = set()
+            merged = []
+            for doc in bm25_docs + embedding_docs:
+                if doc.page_content not in seen:
+                    seen.add(doc.page_content)
+                    merged.append(doc)
+            return merged
 
     @staticmethod
     def _parse_scores(result: str, expected: int) -> list[float]:
@@ -204,6 +209,10 @@ class RAGEngine:
         if not docs:
             return []
 
+        with RAG_STAGE_SECONDS.labels(stage="rerank").time():
+            return self._llm_rerank_inner(docs, question, top_n)
+
+    def _llm_rerank_inner(self, docs: list, question: str, top_n: int) -> list:
         # 拆分成小批，每批独立拼成一个打分请求
         batches = [docs[i:i + RERANK_BATCH_SIZE] for i in range(0, len(docs), RERANK_BATCH_SIZE)]
         inputs = []
@@ -265,6 +274,8 @@ class RAGEngine:
             # 重建 BM25
             self._rebuild_bm25()
 
+            KB_DOCUMENTS.set(len(self._docs))
+            KB_CHUNKS.set(len(self._all_documents))
             return True
 
     def clear(self):
@@ -289,6 +300,8 @@ class RAGEngine:
             self._all_documents = []
             self._bm25_retriever = None
             self._docs = {}
+            KB_DOCUMENTS.set(0)
+            KB_CHUNKS.set(0)
 
     def get_status(self) -> dict:
         """获取当前文档索引状态"""
@@ -436,7 +449,8 @@ class RAGEngine:
 原始问题：{question}"""
         )
         chain = prompt | self.llm | StrOutputParser() | (lambda x: x.split("\n"))
-        queries = chain.invoke({"question": question})
+        with RAG_STAGE_SECONDS.labels(stage="generate_queries").time():
+            queries = chain.invoke({"question": question})
         # 过滤空行，并去掉可能的前缀编号（如 "1. "）
         result = []
         for q in queries:
@@ -501,7 +515,8 @@ class RAGEngine:
             | StrOutputParser()
         )
 
-        answer = rag_chain.invoke(question)
+        with RAG_STAGE_SECONDS.labels(stage="generate").time():
+            answer = rag_chain.invoke(question)
 
         # 提取参考来源
         sources = []
