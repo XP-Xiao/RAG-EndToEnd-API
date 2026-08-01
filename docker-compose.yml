@@ -27,7 +27,6 @@ services:
     volumes:
       # 挂载本机 MinerU/ModelScope 模型缓存
       - E:\MODELSCOPE_HUB\.cache\modelscope:/models/modelscope
-    command: uvicorn main:app --host 0.0.0.0 --port 8000
     networks:
       - default
       - milvus          # 加入 Milvus 所在的外部网络
@@ -51,7 +50,6 @@ services:
       - "8501:8501"
     environment:
       - API_URL=http://backend:8000   # 容器间通过服务名通信
-    command: streamlit run streamlit_app.py --server.port 8501 --server.address 0.0.0.0
     depends_on:
       backend:
         condition: service_healthy
