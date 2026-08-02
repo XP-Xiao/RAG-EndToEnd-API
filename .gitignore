@@ -25,3 +25,7 @@ Thumbs.db
 # ===== 运行时数据 =====
 *.log
 output/
+
+# ===== Reasonix 桌面端会话状态 =====
+.reasonix/
+reasonix.toml
