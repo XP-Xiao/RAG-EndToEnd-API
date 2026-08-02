@@ -16,6 +16,9 @@ from fastapi import Request
 from langchain_core.globals import set_llm_cache
 from langchain_community.cache import RedisCache
 from metrics import LLM_CACHE_TOTAL
+from logger import get_logger
+
+logger = get_logger("redis_cache")
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 LLM_CACHE_TTL = int(os.getenv("LLM_CACHE_TTL", "86400"))  # LLM 响应缓存默认保留 1 天
@@ -69,12 +72,12 @@ def init_llm_cache() -> bool:
         )
         client.ping()
     except Exception as e:
-        print(f"⚠️ Redis 不可用，LLM/答案缓存未启用（服务正常运行）：{e}")
+        logger.warning("redis_unavailable_cache_disabled", error=str(e)[:200])
         return False
 
     _sync_client = client
     set_llm_cache(SafeRedisCache(client, ttl=LLM_CACHE_TTL))
-    print(f"✅ LLM Redis 响应缓存已启用（TTL={LLM_CACHE_TTL}s）")
+    logger.info("llm_cache_enabled", ttl=LLM_CACHE_TTL)
     return True
 
 
@@ -156,7 +159,9 @@ async def aget_cached_answer(question: str, user_id: str = "default_user") -> di
         return None
     try:
         raw = await _async_client.get(key)
-        return json.loads(raw) if raw else None
+        result = json.loads(raw) if raw else None
+        logger.info("answer_cache_lookup", result="hit" if result else "miss", key=key)
+        return result
     except Exception:
         return None
 

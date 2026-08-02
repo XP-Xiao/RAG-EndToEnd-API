@@ -21,6 +21,9 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_openai import ChatOpenAI
 from langchain_community.retrievers import BM25Retriever
 from metrics import RAG_STAGE_SECONDS, KB_DOCUMENTS, KB_CHUNKS
+from logger import get_logger
+
+logger = get_logger("rag_engine")
 
 
 def clean_text(text: str) -> str:
@@ -347,7 +350,9 @@ class RAGEngine:
         if not splits:
             raise ValueError("文本分块后无有效内容")
 
-        return self._add_to_index(splits, doc_name)
+        chunk_count = self._add_to_index(splits, doc_name)
+        logger.info("doc_ingested", doc=doc_name, chunks=chunk_count, source="text")
+        return chunk_count
 
     def ingest_pdf(self, pdf_bytes: bytes, doc_name: str = "") -> int:
         """使用 MinerU 本地 Python API 解析 PDF，按标题语义分块后建立向量索引，返回文档块数"""
@@ -396,11 +401,12 @@ class RAGEngine:
         if not chunks:
             raise ValueError("PDF 分块后无有效内容")
 
-        # Step 3: 入库（Milvus + BM25）
-        return self._add_to_index(
+        chunk_count = self._add_to_index(
             chunks,
             doc_name=doc_name or "未命名PDF",
         )
+        logger.info("pdf_ingested", doc=doc_name, chunks=chunk_count, md_len=len(md_text))
+        return chunk_count
 
     def ingest_url(self, url: str, doc_name: str = "") -> int:
         """从网页 URL 加载文档，按 HTML 标题语义分块后建立向量索引，返回文档块数"""

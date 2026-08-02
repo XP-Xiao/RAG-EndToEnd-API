@@ -11,8 +11,12 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 import re
 import sys
 import time
+import uuid
 import asyncio
 from contextlib import asynccontextmanager
+
+from structlog.contextvars import bind_contextvars, clear_contextvars
+from logger import configure_logging, get_logger
 
 # Windows 默认 ProactorEventLoop 不被 psycopg 异步模式支持，
 # 必须在事件循环创建前切换为 SelectorEventLoop（psycopg 官方要求）
@@ -40,6 +44,10 @@ from redis_cache import (
 # 加载环境变量（DeepSeek API Key 等）
 load_dotenv(find_dotenv())
 
+# 结构化日志（JSON + stdout）：必须在创建 app 之前配置
+configure_logging()
+logger = get_logger("main")
+
 # WebBaseLoader 需要 USER_AGENT
 os.environ.setdefault("USER_AGENT", "RAG-EndToEnd-API/1.0")
 
@@ -56,14 +64,53 @@ async def lifespan(app: FastAPI):
     set_async_client(app.state.redis)
     # 异步初始化 Agent（AsyncPostgresSaver/Store 必须在事件循环内创建）
     await assistant.astart()
+    logger.info("lifespan_startup_complete", redis="connected")
     yield
     # 关闭：释放异步池、同步池（chat_threads 元信息）与 Redis 连接
     await assistant.apool.close()
     await asyncio.to_thread(assistant.pool.close)
     await app.state.redis.aclose()
+    logger.info("lifespan_shutdown_complete")
 
 
 app = FastAPI(title="RAG 文档问答 API", version="1.0", lifespan=lifespan)
+
+# request_id 中间件：为每个 HTTP 请求生成/透传 X-Request-ID，绑定到
+# structlog contextvars——一次请求的所有模块日志自动携带同一 ID
+class RequestIDMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        # 透传调用方传入的 request_id（前端链路复用），否则生成短 ID
+        rid = ""
+        for name, value in scope.get("headers", []):
+            if name == b"x-request-id":
+                rid = value.decode("latin-1")
+                break
+        if not rid:
+            rid = uuid.uuid4().hex[:12]
+        bind_contextvars(request_id=rid)
+
+        # 响应头回写 X-Request-ID，方便前端/调试工具对齐链路
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                headers.append((b"x-request-id", rid.encode()))
+                message["headers"] = headers
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        finally:
+            # 必须清理，否则 contextvar 泄漏到下一个请求（异步复用同线程）
+            clear_contextvars()
+
+
+app.add_middleware(RequestIDMiddleware)
 
 # CORS 配置：允许 Streamlit 前端跨域访问
 app.add_middleware(
@@ -299,10 +346,12 @@ async def agent_ask(req: AgentAskRequest):
     未命中走完整 Agent 流程并回写缓存。对话历史按 thread_id 持久化到 PostgreSQL"""
     # 答案级缓存：仅限全新会话的首条消息（多轮对话依赖上下文，不可回放）
     is_new_thread = not await run_in_threadpool(assistant.thread_exists, req.thread_id)
+    logger.info("agent_ask_started", thread_id=req.thread_id, user_id=req.user_id, is_new_thread=is_new_thread)
     if is_new_thread:
         cached = await aget_cached_answer(req.question, req.user_id)
         ANSWER_CACHE_TOTAL.labels(result="hit" if cached is not None else "miss").inc()
         if cached is not None:
+            logger.info("agent_answer_cache_hit", question_len=len(req.question))
             # 命中：跳过整个 Agent 流程，但把问答补进会话历史，后续多轮不断经
             await assistant.aseed_history(
                 req.thread_id, req.user_id, req.question, cached["answer"]
@@ -318,6 +367,7 @@ async def agent_ask(req: AgentAskRequest):
         result = await assistant.aask(req.question, req.thread_id, req.user_id)
         AGENT_ASK_SECONDS.observe(time.perf_counter() - start)
     except Exception as e:
+        logger.exception("agent_ask_failed", thread_id=req.thread_id, error=str(e)[:300])
         raise HTTPException(status_code=500, detail=f"Agent 执行失败：{str(e)[:300]}")
 
     # token 用量计入监控（回放缓存不走到这里，统计的都是真实消耗）
